@@ -1,0 +1,77 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: deploypolicies.deployguard.io
+spec:
+  group: deployguard.io
+  names:
+    kind: DeployPolicy
+    listKind: DeployPolicyList
+    plural: deploypolicies
+    singular: deploypolicy
+    shortNames:
+      - dp
+  scope: Namespaced  # cada namespace tem sua própria policy
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                requireResources:
+                  type: boolean
+                  description: "Rejeita Deployments sem resources.requests/limits"
+                requireReadinessProbe:
+                  type: boolean
+                  description: "Rejeita Deployments sem readinessProbe"
+                blockLatestTag:
+                  type: boolean
+                  description: "Rejeita imagens com tag :latest ou sem tag"
+                mutate:
+                  type: object
+                  properties:
+                    injectDefaultLimits:
+                      type: boolean
+                    defaultCPURequest:
+                      type: string
+                      example: "100m"
+                    defaultMemoryRequest:
+                      type: string
+                      example: "128Mi"
+                    addLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+      subresources:
+        status: {}  # habilita o subresource /status — necessário para Status().Update()
+      additionalPrinterColumns:
+        - name: Ready
+          type: string
+          jsonPath: ".status.conditions[?(@.type=='Ready')].status"
+        - name: Age
+          type: date
+          jsonPath: ".metadata.creationTimestamp"

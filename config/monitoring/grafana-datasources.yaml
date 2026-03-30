@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources-deployguard
+  namespace: monitoring
+  labels:
+    # Esta label faz o Grafana carregar o ConfigMap automaticamente como datasource.
+    grafana_datasource: "1"
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+
+      # Prometheus — métricas do cluster e do operator
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        url: http://kube-prom-kube-prometheus-prometheus:9090
+        isDefault: true
+        jsonData:
+          timeInterval: 15s
+          # exemplarTraceIdDestinations: liga métricas a traces via trace ID
+          exemplarTraceIdDestinations:
+            - datasourceUid: tempo
+              name: trace_id
+
+      # Tempo — traces do OTEL collector
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        url: http://tempo:3100
+        jsonData:
+          # tracesToLogsV2: clica num trace → vai direto nos logs do Loki
+          tracesToLogsV2:
+            datasourceUid: loki
+            filterByTraceID: true
+            filterBySpanID: false
+            customQuery: true
+            query: '{namespace="${__span.tags["k8s.namespace"]}"} |= "${__trace.traceId}"'
+          # serviceMap: mostra mapa de dependências entre serviços
+          serviceMap:
+            datasourceUid: prometheus
+          # nodeGraph: ativa visualização de grafo de spans
+          nodeGraph:
+            enabled: true
+          # lokiSearch: busca logs correlacionados no Loki
+          lokiSearch:
+            datasourceUid: loki
+
+      # Loki — logs dos pods coletados pelo Promtail
+      - name: Loki
+        type: loki
+        uid: loki
+        url: http://loki:3100
+        jsonData:
+          # derivedFields: extrai trace_id dos logs e cria link pro Tempo
+          derivedFields:
+            - datasourceUid: tempo
+              matcherRegex: '"trace_id":"(\w+)"'
+              name: TraceID
+              url: '$${__value.raw}'
+              urlDisplayLabel: Ver no Tempo

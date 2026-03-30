@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: deployguard-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployguard-controller
+  namespace: deployguard-system
+  labels:
+    app: deployguard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deployguard
+  template:
+    metadata:
+      labels:
+        app: deployguard
+    spec:
+      serviceAccountName: deployguard-controller
+
+      # securityContext do pod: sem root, sem escalação de privilégio.
+      # Boa prática para workloads em Kubernetes — PSS Restricted compliance.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532   # usuário "nonroot" da imagem distroless
+        fsGroup: 65532
+
+      containers:
+        - name: manager
+          # Imagem substituída pelo envsubst no `make deploy`.
+          # Exemplo: make deploy IMG=ghcr.io/santzin/deployguard:v0.1.0
+          image: ${IMG}
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: webhook
+              containerPort: 9443
+              protocol: TCP
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: healthz
+              containerPort: 8081
+              protocol: TCP
+
+          env:
+            - name: OPERATOR_NAMESPACE
+              # Injeta o namespace onde o pod está rodando — evita hardcode.
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CERT_DIR
+              value: /tmp/deployguard-certs
+            # ENV=production ativa o exporter OTLP no telemetry.Setup().
+            # Em dev, remova esta var ou mude para qualquer outro valor.
+            - name: ENV
+              value: production
+            # OTEL_EXPORTER_OTLP_ENDPOINT: endereço do collector OTLP.
+            # Ajuste para o endpoint do seu collector (Jaeger/Tempo/etc).
+            # Sem esta var o OTLP client usa o padrão: http://localhost:4318.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability.svc.cluster.local:4318
+
+          # Cert rotator cria o cert em CERT_DIR na primeira execução.
+          # emptyDir é recriado a cada restart do pod — o rotator regenera o cert.
+          # Volume compartilhado entre o rotator e o webhook server TLS.
+          volumeMounts:
+            - name: cert-dir
+              mountPath: /tmp/deployguard-certs
+
+          # Resources: o próprio projeto valida que Deployments tenham resources.
+          # Seja um bom cidadão: siga as mesmas regras que você impõe.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+
+          # Readiness probe: o próprio projeto valida que Deployments tenham probe.
+          # O manager registra o endpoint /readyz em :8081 via AddReadyzCheck.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Liveness probe: se travar por algum bug, o kubelet reinicia o pod.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: cert-dir
+          emptyDir: {}
+
+      # topologySpreadConstraints + PodAntiAffinity garantem que as réplicas
+      # fiquem em nodes diferentes. Útil se você escalar para 2+ réplicas.
+      # Com replicas: 1 não tem efeito prático, mas documenta a intenção.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: deployguard
+                topologyKey: kubernetes.io/hostname

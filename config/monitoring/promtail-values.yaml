@@ -1,0 +1,42 @@
+# Promtail values para GKE Autopilot.
+# Autopilot só permite hostPath em /var/log/ — removemos os outros volumes.
+defaultVolumes:
+  - name: varlog
+    hostPath:
+      path: /var/log
+
+defaultVolumeMounts:
+  - name: varlog
+    mountPath: /var/log
+    readOnly: true
+
+config:
+  lokiAddress: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push
+  snippets:
+    # Coleta logs dos pods em /var/log/pods/
+    # Extrai namespace, pod e container do path do arquivo.
+    pipelineStages:
+      - cri: {}
+    scrapeConfigs: |
+      - job_name: kubernetes-pods
+        pipeline_stages:
+          - cri: {}
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: __host__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          - replacement: /var/log/pods/*$1/*.log
+            separator: /
+            source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            target_label: __path__

@@ -1,0 +1,110 @@
+# ============================================================
+# Exemplo 1: DeployPolicy para o namespace "production"
+# Aplica as regras mais restritivas.
+# ============================================================
+apiVersion: deployguard.io/v1alpha1
+kind: DeployPolicy
+metadata:
+  name: production-policy
+  namespace: production
+spec:
+  # Rejeita Deployments sem resources.requests/limits
+  requireResources: true
+
+  # Rejeita imagens com tag :latest ou sem tag
+  blockLatestTag: true
+
+  # Rejeita Deployments sem readinessProbe
+  requireReadinessProbe: true
+
+  # Mutações automáticas aplicadas antes da validação
+  mutate:
+    # Injeta resources padrão se o container não tiver definido
+    injectDefaultLimits: true
+    defaultCPURequest: "100m"
+    defaultMemoryRequest: "128Mi"
+
+    # Adiciona labels a todos os pods gerenciados por esta policy
+    addLabels:
+      managed-by: deployguard
+      env: production
+---
+# ============================================================
+# Exemplo 2: DeployPolicy mais permissiva para "staging"
+# ============================================================
+apiVersion: deployguard.io/v1alpha1
+kind: DeployPolicy
+metadata:
+  name: staging-policy
+  namespace: staging
+spec:
+  blockLatestTag: true   # em staging também queremos tags explícitas
+  mutate:
+    addLabels:
+      managed-by: deployguard
+      env: staging
+---
+# ============================================================
+# Deployment RUIM — vai ser rejeitado pelo webhook em "production"
+# Use esse para testar: kubectl apply -f examples/ -n production
+# Você vai ver o erro no output do kubectl.
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-deployment
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bad-app
+  template:
+    metadata:
+      labels:
+        app: bad-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest      # ← BLOQUEADO: tag :latest
+          ports:
+            - containerPort: 80
+          # sem resources         ← BLOQUEADO: requireResources
+          # sem readinessProbe    ← BLOQUEADO: requireReadinessProbe
+---
+# ============================================================
+# Deployment BOM — vai passar pelo webhook
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: good-deployment
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: good-app
+  template:
+    metadata:
+      labels:
+        app: good-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25.3      # tag explícita ✓
+          ports:
+            - containerPort: 80
+          resources:               # resources definidos ✓
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:          # readinessProbe definido ✓
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10

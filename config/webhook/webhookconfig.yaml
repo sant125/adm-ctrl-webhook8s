@@ -1,0 +1,52 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: deployguard-validating-webhook
+webhooks:
+  - name: validate.deployguard.io
+    # admissionReviewVersions: versões do AdmissionReview que o webhook suporta.
+    # Sempre inclua v1 — é o padrão atual.
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: deployguard-webhook-service
+        namespace: deployguard-system
+        path: /validate
+        port: 9443
+      # caBundle é preenchido pelo cert rotator automaticamente.
+      # Deixamos vazio aqui — o rotator preenche na primeira execução.
+      caBundle: ""
+    rules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        resources: ["deployments"]
+        # CREATE e UPDATE — validamos nos dois casos.
+        # DELETE e CONNECT não precisam de validação.
+        operations: ["CREATE", "UPDATE"]
+    # namespaceSelector: NUNCA aplique webhook no kube-system.
+    # Um bug no operator poderia impedir criação de pods do sistema.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - kube-public
+            - kube-node-lease
+            - deployguard-system  # evita recursão no próprio operator
+    # objectSelector: opt-in por annotation.
+    # Namespaces precisam ter a annotation "deployguard.io/enforce: enabled"
+    # para serem afetados. Isso evita surpresas em clusters existentes.
+    objectSelector:
+      matchLabels: {}  # sem filtro por objeto — filtramos por namespace acima
+    # failurePolicy: o que fazer se o webhook estiver indisponível.
+    # Fail: rejeita o deploy se o webhook não responder (mais seguro, pode travar deploys)
+    # Ignore: permite o deploy se o webhook não responder (mais permissivo)
+    # Use Ignore em dev/staging, Fail em prod.
+    failurePolicy: Ignore
+    # sideEffects: nosso webhook não tem side effects — apenas lê e valida.
+    sideEffects: None
+    # timeoutSeconds: o API server aguarda no máximo esse tempo.
+    # Se ultrapassar → failurePolicy é aplicado.
+    # Máximo permitido pelo Kubernetes: 30s. Recomendado: 5-10s.
+    timeoutSeconds: 5

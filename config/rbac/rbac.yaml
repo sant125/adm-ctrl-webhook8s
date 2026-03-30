@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deployguard-controller
+  namespace: deployguard-system
+  annotations:
+    # Workload Identity: vincula este K8s SA ao Google Service Account.
+    # O pod recebe um token OIDC que o GCP aceita como identidade — sem chave JSON.
+    iam.gke.io/gcp-service-account: deployguard-operator@certquest.iam.gserviceaccount.com
+---
+# ClusterRole: permissões que o operator precisa no cluster inteiro.
+# Princípio do menor privilégio: pedimos apenas o que precisamos.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: deployguard-controller
+rules:
+  # Precisa ler/escrever DeployPolicy em qualquer namespace.
+  - apiGroups: ["deployguard.io"]
+    resources: ["deploypolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Precisa atualizar o status subresource separadamente.
+  - apiGroups: ["deployguard.io"]
+    resources: ["deploypolicies/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Precisa atualizar o finalizer (via /finalizers subresource).
+  - apiGroups: ["deployguard.io"]
+    resources: ["deploypolicies/finalizers"]
+    verbs: ["update"]
+
+  # Cert rotator precisa assistir e atualizar o caBundle nos webhook configs.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Cert rotator precisa ler/criar/atualizar o Secret com o cert.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Leader election usa Leases.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Precisa criar Events para reportar erros e ações.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: deployguard-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: deployguard-controller
+subjects:
+  - kind: ServiceAccount
+    name: deployguard-controller
+    namespace: deployguard-system
+---
+# Service: expõe o webhook server dentro do cluster.
+# O API server chama o webhook via esse Service.
+# IMPORTANTE: o nome do Service deve corresponder ao ServiceName no cert rotator.
+apiVersion: v1
+kind: Service
+metadata:
+  name: deployguard-webhook-service
+  namespace: deployguard-system
+spec:
+  selector:
+    app: deployguard
+  ports:
+    - name: webhook
+      port: 9443
+      targetPort: 9443
+      protocol: TCP
