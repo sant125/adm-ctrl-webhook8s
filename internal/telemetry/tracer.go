@@ -6,10 +6,10 @@
 // O destino é configurado aqui, uma vez, no setup.
 //
 // DOIS MODOS:
-// - dev  (ENV != "production"): exporta pro stdout — você vê os spans no terminal
-// - prod (ENV == "production"): exporta via OTLP pro OTEL Collector
-//   O collector roda no cluster e exporta pro Cloud Trace via Workload Identity.
-//   O app não sabe nem se importa com o destino final — só fala OTLP.
+//   - dev  (ENV != "production"): exporta pro stdout — você vê os spans no terminal
+//   - prod (ENV == "production"): exporta via OTLP pro OTEL Collector
+//     O collector roda no cluster e exporta pro Cloud Trace via Workload Identity.
+//     O app não sabe nem se importa com o destino final — só fala OTLP.
 package telemetry
 
 import (

@@ -6,9 +6,11 @@ import (
 	"context"
 
 	"github.com/santzin/deployguard/api/v1alpha1"
+	"github.com/santzin/deployguard/internal/metrics"
 	"github.com/santzin/deployguard/internal/rules"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	appsv1 "k8s.io/api/apps/v1"
 )
 
@@ -82,6 +84,16 @@ func (e *Evaluator) Evaluate(ctx context.Context, deploy *appsv1.Deployment) []r
 			attribute.Bool("passed", len(violations) == 0),
 		)
 		ruleSpan.End()
+
+		// Métrica: incrementa UMA vez POR VIOLAÇÃO encontrada pela regra.
+		// Isso permite responder "qual regra foi mais violada na última semana?"
+		// agregando por label `rule`. Labels: namespace do deployment + nome da regra.
+		if n := len(violations); n > 0 {
+			metrics.Violations.Add(ctx, int64(n), metric.WithAttributes(
+				attribute.String("namespace", deploy.Namespace),
+				attribute.String("rule", rule.Name()),
+			))
+		}
 
 		allViolations = append(allViolations, violations...)
 	}

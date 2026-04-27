@@ -6,7 +6,7 @@
 # Multi-stage build: a imagem final não vai ter o compilador Go,
 # apenas o binário — imagem menor e mais segura.
 # ============================================================
-FROM golang:1.26-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 # Instala dependências de build mínimas.
 # ca-certificates: necessário para TLS em binários Go estáticos.

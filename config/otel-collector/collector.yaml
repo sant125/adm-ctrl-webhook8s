@@ -24,6 +24,11 @@ metadata:
   namespace: observability
 data:
   config.yaml: |
+    # ==========================================================
+    # RECEIVERS: o que o collector aceita na entrada.
+    # Nosso app fala OTLP (HTTP em 4318, gRPC em 4317) — aceitamos os dois
+    # pra ficar flexível (alguns SDKs usam um, outros usam outro).
+    # ==========================================================
     receivers:
       otlp:
         protocols:
@@ -32,24 +37,54 @@ data:
           grpc:
             endpoint: 0.0.0.0:4317
 
+    # ==========================================================
+    # EXPORTERS: pra onde o collector manda. É AQUI que mora o "lock-in".
+    # O APP continua vendor-neutral — só fala OTLP. Pra trocar backend,
+    # mexe só nessa seção.
+    # ==========================================================
     exporters:
+      # TRACES → Tempo (OTLP gRPC nativo).
       otlp/tempo:
-        # Tempo aceita OTLP nativamente.
-        # Roda no namespace monitoring, instalado via Helm.
         endpoint: tempo.monitoring.svc.cluster.local:4317
         tls:
           insecure: true
 
+      # MÉTRICAS → endpoint Prometheus-scrapeable.
+      # Esse exporter é PULL, não push — expõe /metrics na :8889 e o Prometheus
+      # (kube-prometheus-stack) vem buscar. OTEL nome "deployguard.admission.requests"
+      # vira Prom "deployguard_admission_requests_total" automaticamente.
+      #
+      # Alternativa pra ambiente com Prometheus remoto: prometheusremotewrite.
+      # Pull combina com o padrão já instalado do kube-prometheus-stack.
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          # Copia atributos do Resource (service.name, service.version) como
+          # labels Prometheus. Assim filtras por service_name="deployguard".
+          enabled: true
+
+    # ==========================================================
+    # PROCESSORS: transformações aplicadas no meio do pipeline.
+    # batch agrupa observações antes de exportar — reduz I/O.
+    # ==========================================================
     processors:
       batch:
-        # agrupa spans antes de exportar — reduz chamadas à API do Cloud Trace
         send_batch_size: 100
         timeout: 5s
 
+    # ==========================================================
+    # EXTENSIONS: componentes auxiliares (não entram em pipeline).
+    # health_check vira o endpoint da readinessProbe.
+    # ==========================================================
     extensions:
       health_check:
         endpoint: 0.0.0.0:13133
 
+    # ==========================================================
+    # SERVICE: liga receivers → processors → exporters em PIPELINES.
+    # Traces e Metrics são pipelines INDEPENDENTES — podem ter
+    # processors e destinos diferentes.
+    # ==========================================================
     service:
       extensions: [health_check]
       pipelines:
@@ -57,6 +92,10 @@ data:
           receivers: [otlp]
           processors: [batch]
           exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheus]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -83,8 +122,10 @@ spec:
           image: otel/opentelemetry-collector-contrib:0.123.0
           args: ["--config=/conf/config.yaml"]
           ports:
-            - containerPort: 4317  # OTLP gRPC
-            - containerPort: 4318  # OTLP HTTP
+            - containerPort: 4317  # OTLP gRPC (traces + metrics)
+            - containerPort: 4318  # OTLP HTTP (traces + metrics)
+            - containerPort: 8889  # Prometheus exporter (scrape target)
+            - containerPort: 13133 # health_check
           volumeMounts:
             - name: config
               mountPath: /conf
@@ -179,12 +220,25 @@ spec:
       port: 4318
       targetPort: 4318
 ---
-# Service interno — o deployguard aponta pra cá via OTEL_EXPORTER_OTLP_ENDPOINT
+# Service interno — o deployguard aponta pra cá via OTEL_EXPORTER_OTLP_ENDPOINT.
+# Annotations dizem ao Prometheus Operator pra fazer scrape direto (sem precisar
+# de ServiceMonitor manual pra instalação simples).
 apiVersion: v1
 kind: Service
 metadata:
   name: otel-collector
   namespace: observability
+  labels:
+    # kube-prometheus-stack usa essa label pra descobrir alvos via ServiceMonitor
+    # (quando a gente criar um mais tarde).
+    app.kubernetes.io/name: otel-collector
+  annotations:
+    # Se você não usar ServiceMonitor, esses campos ligam o scrape legacy
+    # (Prometheus vanilla). O kube-prometheus-stack prefere ServiceMonitor,
+    # mas ter essas annotations é bom como fallback/documentação.
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8889"
+    prometheus.io/path: "/metrics"
 spec:
   selector:
     app: otel-collector
@@ -195,3 +249,33 @@ spec:
     - name: otlp-http
       port: 4318
       targetPort: 4318
+    # Porta onde as métricas OTEL saem em formato Prometheus.
+    # Acesse via kubectl port-forward svc/otel-collector -n observability 8889:8889
+    # e curl localhost:8889/metrics pra conferir.
+    - name: prom-metrics
+      port: 8889
+      targetPort: 8889
+---
+# ServiceMonitor — diz pro Prometheus Operator (kube-prometheus-stack) pra
+# scrapear o collector. Só funciona se o Prometheus Operator estiver instalado.
+# Se rodar sem kube-prometheus-stack, comenta esse bloco.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    # Tem que bater com `serviceMonitorSelector` do Prometheus CRD.
+    # kube-prometheus-stack com `serviceMonitorSelectorNilUsesHelmValues=false`
+    # (ver bootstrap.sh) aceita ServiceMonitor de qualquer namespace sem selector.
+    release: kube-prom
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  namespaceSelector:
+    matchNames: [observability]
+  endpoints:
+    - port: prom-metrics       # referencia o `name` da porta no Service
+      interval: 30s
+      path: /metrics

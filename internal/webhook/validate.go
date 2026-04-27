@@ -7,18 +7,28 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/santzin/deployguard/api/v1alpha1"
+	"github.com/santzin/deployguard/internal/metrics"
 	"github.com/santzin/deployguard/internal/policy"
 	"github.com/santzin/deployguard/internal/rules"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// Valores de decision usados nas métricas. Constantes evitam typo em string.
+const (
+	decisionAllow = "allow"
+	decisionDeny  = "deny"
+	decisionError = "error"
 )
 
 var tracer = otel.Tracer("deployguard/webhook")
@@ -37,6 +47,34 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	ctx, span := tracer.Start(r.Context(), "admission/validate")
 	defer span.End()
 	r = r.WithContext(ctx)
+
+	// ==================================================================
+	// MÉTRICAS OTEL — contabilizar toda admission, qualquer que seja o fim.
+	//
+	// Técnica: closure em variáveis locais que vão sendo preenchidas ao
+	// longo da função, e um único defer que observa o resultado final.
+	//
+	// Por que assim em vez de incrementar em cada return?
+	// - Centraliza a lógica (fácil adicionar nova métrica depois).
+	// - Impossível esquecer de contar num caminho de retorno novo.
+	// - Captura duração TOTAL, incluindo o writeAdmissionResponse final.
+	// ==================================================================
+	start := time.Now()
+	decision := decisionError // default: se der panic/early return, registra erro
+	namespace := ""
+	operation := ""
+	defer func() {
+		attrs := metric.WithAttributes(
+			attribute.String("namespace", namespace),
+			attribute.String("operation", operation),
+			attribute.String("decision", decision),
+		)
+		metrics.AdmissionRequests.Add(ctx, 1, attrs)
+		// Duração: só leva o atributo "decision" — namespace/operation inflariam
+		// cardinalidade do histograma (que já é caro por natureza).
+		metrics.AdmissionDuration.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(attribute.String("decision", decision)))
+	}()
 
 	logger := log.FromContext(r.Context()).WithName("validate")
 
@@ -60,6 +98,10 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := admissionReview.Request
+	// Preenche os labels das métricas agora que já temos a request.
+	namespace = req.Namespace
+	operation = string(req.Operation)
+
 	logger = logger.WithValues(
 		"uid", req.UID,
 		"namespace", req.Namespace,
@@ -80,6 +122,7 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	var deploy appsv1.Deployment
 	if err := json.Unmarshal(req.Object.Raw, &deploy); err != nil {
 		logger.Error(err, "failed to decode Deployment")
+		decision = decisionDeny
 		writeAdmissionResponse(w, denyResponse(req.UID, "failed to decode deployment object"))
 		return
 	}
@@ -91,6 +134,8 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 		// IMPORTANTE: Em caso de erro ao buscar a policy, APROVAMOS o deploy.
 		// Isso é "fail open" — evita travar deploys por problema no próprio operator.
 		// Em ambientes de alta segurança, pode-se mudar para "fail closed" (deny).
+		// Nas métricas fica como "error" pra ser visível em alertas.
+		decision = decisionError
 		writeAdmissionResponse(w, allowResponse(req.UID))
 		return
 	}
@@ -98,6 +143,7 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	// Sem policy no namespace → nenhuma restrição aplicada.
 	if deployPolicy == nil {
 		logger.V(1).Info("no DeployPolicy found in namespace, allowing")
+		decision = decisionAllow
 		writeAdmissionResponse(w, allowResponse(req.UID))
 		return
 	}
@@ -108,6 +154,7 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 
 	if len(violations) == 0 {
 		logger.Info("deployment passed all policy checks")
+		decision = decisionAllow
 		writeAdmissionResponse(w, allowResponse(req.UID))
 		return
 	}
@@ -116,6 +163,7 @@ func (h *Handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	// O dev vai ver essa mensagem no output do `kubectl apply`.
 	message := formatViolations(violations)
 	logger.Info("deployment rejected by policy", "violations", len(violations))
+	decision = decisionDeny
 	writeAdmissionResponse(w, denyResponse(req.UID, message))
 }
 

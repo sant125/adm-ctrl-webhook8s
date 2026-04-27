@@ -21,6 +21,7 @@ import (
 	"github.com/santzin/deployguard/api/v1alpha1"
 	"github.com/santzin/deployguard/internal/certrotator"
 	"github.com/santzin/deployguard/internal/controller"
+	"github.com/santzin/deployguard/internal/metrics"
 	"github.com/santzin/deployguard/internal/telemetry"
 	"github.com/santzin/deployguard/internal/webhook"
 	appsv1 "k8s.io/api/apps/v1"
@@ -59,13 +60,34 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(isDev())))
 
 	// OTEL — mesmo padrão do SetLogger: registra global antes de subir qualquer componente.
-	// Em dev imprime spans no stdout. Em prod exporta via OTLP pro collector.
+	// Em dev imprime spans/metrics no stdout. Em prod exporta via OTLP pro collector.
+	//
+	// ORDEM IMPORTA:
+	//   1. Providers registrados globalmente (Tracer + Meter)
+	//   2. metrics.Init() constrói os instrumentos usando o MeterProvider
+	//   3. Todo o resto sobe, já com OTEL pronto pra receber eventos
+	//
+	// Se inverter a ordem, os instrumentos pegam um MeterProvider no-op
+	// (silencioso) e nada é exportado — bug clássico em OTEL.
 	shutdownTracing, err := telemetry.Setup(context.Background())
 	if err != nil {
 		setupLog.Error(err, "unable to setup tracing")
 		os.Exit(1)
 	}
 	defer shutdownTracing() // flush dos spans pendentes no graceful shutdown
+
+	shutdownMetrics, err := telemetry.SetupMetrics(context.Background())
+	if err != nil {
+		setupLog.Error(err, "unable to setup metrics")
+		os.Exit(1)
+	}
+	defer shutdownMetrics()
+
+	// Agora que MeterProvider está registrado, podemos construir os instrumentos.
+	if err := metrics.Init(); err != nil {
+		setupLog.Error(err, "unable to initialize metrics")
+		os.Exit(1)
+	}
 
 	// Lê configurações do ambiente.
 	// Preferimos env vars a flags para configuração de operator — mais Kubernetes-native.
