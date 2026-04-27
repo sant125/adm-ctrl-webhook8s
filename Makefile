@@ -109,7 +109,7 @@ uninstall: ## Remove o CRD do cluster
 	kubectl delete -f config/crd/ --ignore-not-found
 
 .PHONY: deploy
-deploy: ## Deploy completo: namespace + rbac + webhook config + operator
+deploy: ## Deploy completo: namespace + rbac + webhook + operator + networkpolicy
 	kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	kubectl apply -f config/crd/
 	kubectl apply -f config/rbac/
@@ -117,9 +117,17 @@ deploy: ## Deploy completo: namespace + rbac + webhook config + operator
 	# Substitui a imagem no deployment antes de aplicar.
 	# Em produção use kustomize ou helm para isso.
 	IMG=$(IMG) envsubst < config/manager/deployment.yaml | kubectl apply -f -
+	# NetworkPolicies por último — se aplicar antes do deployment estar rodando,
+	# o webhook do próprio operator pode bloquear o próprio ingress inicial.
+	kubectl apply -f config/networkpolicy/
+
+.PHONY: deploy-otel
+deploy-otel: ## Deploy do collector OTEL (traces + metrics) + Jaeger no cluster
+	kubectl apply -f config/otel-collector/
 
 .PHONY: undeploy
 undeploy: ## Remove tudo do cluster
+	kubectl delete -f config/networkpolicy/ --ignore-not-found
 	kubectl delete -f config/webhook/ --ignore-not-found
 	kubectl delete -f config/rbac/ --ignore-not-found
 	kubectl delete -f config/crd/ --ignore-not-found

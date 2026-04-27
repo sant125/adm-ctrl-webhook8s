@@ -1,6 +1,33 @@
 # ============================================================
+# Namespaces de exemplo JÁ LABELADOS com opt-in do DeployGuard.
+#
+# A label deployguard.io/enforce=enabled é o gatilho do webhook
+# (veja namespaceSelector em config/webhook/webhookconfig.yaml).
+# Sem ela, o webhook nem é chamado — o namespace fica intacto.
+#
+# Pra habilitar um namespace existente:
+#   kubectl label namespace <nome> deployguard.io/enforce=enabled
+#
+# Pra desabilitar (rollback rápido):
+#   kubectl label namespace <nome> deployguard.io/enforce-
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    deployguard.io/enforce: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    deployguard.io/enforce: enabled
+---
+# ============================================================
 # Exemplo 1: DeployPolicy para o namespace "production"
-# Aplica as regras mais restritivas.
+# Liga todas as regras — postura mais restritiva.
 # ============================================================
 apiVersion: deployguard.io/v1alpha1
 kind: DeployPolicy
@@ -8,7 +35,7 @@ metadata:
   name: production-policy
   namespace: production
 spec:
-  # Rejeita Deployments sem resources.requests/limits
+  # Rejeita Deployments sem resources.requests
   requireResources: true
 
   # Rejeita imagens com tag :latest ou sem tag
@@ -16,21 +43,10 @@ spec:
 
   # Rejeita Deployments sem readinessProbe
   requireReadinessProbe: true
-
-  # Mutações automáticas aplicadas antes da validação
-  mutate:
-    # Injeta resources padrão se o container não tiver definido
-    injectDefaultLimits: true
-    defaultCPURequest: "100m"
-    defaultMemoryRequest: "128Mi"
-
-    # Adiciona labels a todos os pods gerenciados por esta policy
-    addLabels:
-      managed-by: deployguard
-      env: production
 ---
 # ============================================================
 # Exemplo 2: DeployPolicy mais permissiva para "staging"
+# Só exige tag explícita. Resto é livre — é staging.
 # ============================================================
 apiVersion: deployguard.io/v1alpha1
 kind: DeployPolicy
@@ -38,16 +54,15 @@ metadata:
   name: staging-policy
   namespace: staging
 spec:
-  blockLatestTag: true   # em staging também queremos tags explícitas
-  mutate:
-    addLabels:
-      managed-by: deployguard
-      env: staging
+  blockLatestTag: true
 ---
 # ============================================================
-# Deployment RUIM — vai ser rejeitado pelo webhook em "production"
-# Use esse para testar: kubectl apply -f examples/ -n production
-# Você vai ver o erro no output do kubectl.
+# Deployment RUIM — vai ser rejeitado pelo webhook em "production".
+#
+# Pra testar:
+#   kubectl apply -f config/examples/demo.yaml
+# O apply vai criar o namespace, a policy e até o good-deployment,
+# mas vai FALHAR aqui com mensagem lista de violações.
 # ============================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -66,14 +81,14 @@ spec:
     spec:
       containers:
         - name: app
-          image: nginx:latest      # ← BLOQUEADO: tag :latest
+          image: nginx:latest      # BLOQUEADO: tag :latest
           ports:
             - containerPort: 80
-          # sem resources         ← BLOQUEADO: requireResources
-          # sem readinessProbe    ← BLOQUEADO: requireReadinessProbe
+          # sem resources          → BLOQUEADO: requireResources
+          # sem readinessProbe     → BLOQUEADO: requireReadinessProbe
 ---
 # ============================================================
-# Deployment BOM — vai passar pelo webhook
+# Deployment BOM — passa por todas as regras.
 # ============================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -92,17 +107,17 @@ spec:
     spec:
       containers:
         - name: app
-          image: nginx:1.25.3      # tag explícita ✓
+          image: nginx:1.25.3      # tag explícita
           ports:
             - containerPort: 80
-          resources:               # resources definidos ✓
+          resources:
             requests:
               cpu: "100m"
               memory: "128Mi"
             limits:
               cpu: "500m"
               memory: "256Mi"
-          readinessProbe:          # readinessProbe definido ✓
+          readinessProbe:
             httpGet:
               path: /
               port: 80

@@ -32,21 +32,9 @@ spec:
                 blockLatestTag:
                   type: boolean
                   description: "Rejeita imagens com tag :latest ou sem tag"
-                mutate:
-                  type: object
-                  properties:
-                    injectDefaultLimits:
-                      type: boolean
-                    defaultCPURequest:
-                      type: string
-                      example: "100m"
-                    defaultMemoryRequest:
-                      type: string
-                      example: "128Mi"
-                    addLabels:
-                      type: object
-                      additionalProperties:
-                        type: string
+                # Campo `mutate` removido — prometido mas nunca implementado no código.
+                # Se um dia implementarmos o /mutate webhook (JSON Patch RFC 6902),
+                # ele reaparece aqui com shape bem definido.
             status:
               type: object
               properties:
