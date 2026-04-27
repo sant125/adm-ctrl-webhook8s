@@ -1,0 +1,183 @@
+# ============================================================
+# NetworkPolicy — firewall L3/L4 nativo do Kubernetes.
+#
+# CONCEITOS FUNDAMENTAIS:
+#
+# 1. NetworkPolicy só FAZ EFEITO se a CNI suportar (Calico, Cilium, etc).
+#    Em GKE com "network policy enabled" funciona. Em Autopilot é enforced
+#    sempre. Em kind/minikube padrão, a CNI default (kindnet) IGNORA NPs —
+#    você cria, não quebra nada, mas também não protege. Pra dev, instalar
+#    Calico no kind.
+#
+# 2. NetworkPolicy é ADITIVA. Default = tudo permitido. Se NENHUMA NP
+#    seleciona um pod, o pod fica com allow-all. Se PELO MENOS UMA NP
+#    seleciona um pod, o pod passa a deny-by-default — só libera o que
+#    alguma NP permitir explicitamente.
+#
+# 3. podSelector {} = "todos os pods do namespace".
+#    policyTypes decide se aplica a Ingress, Egress ou os dois.
+#
+# 4. Ingress é "quem pode me FALAR". Egress é "com quem eu posso falar".
+#    Direção é do ponto de vista do pod-alvo (matchLabels).
+#
+# Teste:
+#   kubectl -n deployguard-system run test --rm -it --image=busybox -- sh
+#   # dentro: wget -T5 -qO- google.com   → timeout (egress bloqueado)
+#   # e: wget -T5 -qO- otel-collector.observability.svc:4318  → ok
+# ============================================================
+
+---
+# 1. DEFAULT DENY — baseline. Ninguém fala com ninguém até permitir explícito.
+#
+# Por que separar em NP própria?
+# Boa prática: default-deny é imutável/óbvio, e as allows ficam em NPs
+# separadas por propósito (DNS, collector, webhook, etc). Facilita review.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: deployguard-system
+spec:
+  podSelector: {}              # todos os pods do namespace
+  policyTypes: [Ingress, Egress]
+  # sem ingress/egress = zero permitido. Literalmente firewall fechado.
+
+---
+# 2. DNS EGRESS — os pods precisam resolver nomes (APIs, collector, etc).
+# Sem isso, nem o cluster-internal DNS funciona e o pod quebra em tudo.
+#
+# A regra libera UDP+TCP/53 pra kube-dns (CoreDNS) no kube-system.
+# Em GKE, o label é k8s-app=kube-dns.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: deployguard-system
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# 3. API SERVER EGRESS — o operator fala com o API server pra listar
+# DeployPolicies, criar Events, atualizar Secrets, etc.
+#
+# Complicado: o API server não está num namespace pod-com-labels.
+# Ele expõe um Service "kubernetes" em default na 443, que aponta pra
+# IPs do control plane (fora do pod network em managed clusters).
+#
+# Caminho mais simples: liberar egress pra qualquer IP na porta 443.
+# Em cluster self-managed dá pra restringir mais via ipBlock com CIDR do
+# control plane, mas em GKE/EKS o IP muda, então 443/* é prático.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-kubernetes-api
+  namespace: deployguard-system
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # Sem except aqui — 443 é aberto pra internet inteira. Se quiser
+            # amarrar só no control plane, descubra o CIDR com:
+            #   kubectl get endpoints kubernetes -o yaml
+            # e coloca em `cidr`. Atenção: em GKE esse IP rota
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+# 4. EGRESS PRO OTEL COLLECTOR — traces + metrics.
+# Permite tanto OTLP gRPC (4317) quanto HTTP (4318). Sua app usa HTTP hoje,
+# mas deixar os dois evita dor de cabeça se alguém trocar.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-otel-collector
+  namespace: deployguard-system
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+
+---
+# 5. INGRESS PRO WEBHOOK (9443) — o API server chama nosso pod nessa porta.
+#
+# PROBLEMA CLÁSSICO: o API server não é um pod com labels — vem do control
+# plane, IP variável. NetworkPolicy não consegue filtrar por "API server"
+# diretamente.
+#
+# Solução: liberar ingress na 9443 de QUALQUER origem. Isso é OK porque:
+#   (a) O webhook só aceita TLS (cert assinado pela nossa CA).
+#   (b) A porta 9443 só faz sentido pra admission — nada mais usa.
+#   (c) Se algum pod hostil no cluster tentar chamar, vai receber TLS
+#       válido mas a requisição é um AdmissionReview sem efeito prático
+#       (a gente só lê, não persiste).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-webhook
+  namespace: deployguard-system
+spec:
+  podSelector:
+    matchLabels:
+      app: deployguard
+  policyTypes: [Ingress]
+  ingress:
+    - from: []                 # from vazio = de qualquer origem
+      ports:
+        - protocol: TCP
+          port: 9443
+
+---
+# 6. INGRESS PRAS MÉTRICAS E HEALTH — Prometheus/kubelet precisam alcançar.
+#
+# :8080 metrics (controller-runtime default)
+# :8081 health (readinessProbe/livenessProbe do kubelet)
+#
+# Do kubelet não dá pra filtrar por pod selector (não é um pod). Então
+# abrimos from: [] também. Mesma análise de segurança do webhook acima.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-metrics-health
+  namespace: deployguard-system
+spec:
+  podSelector:
+    matchLabels:
+      app: deployguard
+  policyTypes: [Ingress]
+  ingress:
+    - from: []
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081

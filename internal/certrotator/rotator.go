@@ -177,11 +177,30 @@ func (r *Rotator) generateCert() (certPEM, keyPEM, caPEM []byte, err error) {
 		return nil, nil, nil, fmt.Errorf("generating private key: %w", err)
 	}
 
+	// SERIAL NUMBER — 128 bits aleatórios.
+	//
+	// Por que não deixar fixo em 1?
+	// - RFC 5280 exige serial único por CA. Dois certs com mesmo serial emitidos
+	//   pela mesma CA tecnicamente são inválidos.
+	// - Alguns clientes TLS (e scanners de segurança) sinalizam serial=1 como
+	//   "cert auto-gerado de brinquedo" — acende flag vermelha em auditoria.
+	// - Na rotação, cert antigo e novo teriam o MESMO serial — se alguém revogar
+	//   via CRL/OCSP por serial, revogaria os dois. Irrelevante em self-signed,
+	//   mas o costume certo já vale ser aprendido aqui.
+	//
+	// Como geramos: rand.Int(rand.Reader, 2^128) devolve inteiro aleatório
+	// criptográfico no intervalo [0, 2^128). Lsh = left shift (1 << 128).
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("generating serial number: %w", err)
+	}
+
 	// Template do certificado.
 	// O SAN (Subject Alternative Name) deve incluir o DNS do Service
 	// porque é assim que o API server se conecta ao webhook.
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"deployguard"},
 		},

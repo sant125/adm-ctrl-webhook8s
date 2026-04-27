@@ -28,6 +28,27 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532   # usuário "nonroot" da imagem distroless
         fsGroup: 65532
+        # seccompProfile: filtra quais syscalls o kernel aceita do container.
+        #
+        # O que é seccomp? "secure computing mode" — feature do kernel Linux que
+        # bloqueia chamadas de sistema específicas. Usado em sandboxes (Chrome, Docker).
+        #
+        # Tipos possíveis:
+        # - Unconfined    → sem filtro. DEFAULT em muitas distros. Inseguro.
+        # - RuntimeDefault → filtro que o runtime (containerd/cri-o) já traz.
+        #                    Bloqueia ~60 syscalls perigosas (mount, reboot, kexec_load,
+        #                    ptrace, swapon, etc). Suficiente pra 99% dos apps.
+        # - Localhost      → perfil customizado em /var/lib/kubelet/seccomp/ — pra
+        #                    apps que precisam de syscalls específicas.
+        #
+        # PSS Restricted exige RuntimeDefault ou Localhost. Kubernetes 1.27+ já aplica
+        # RuntimeDefault por padrão via SeccompDefault feature gate — mas declarar
+        # explícito protege contra clusters com o gate desligado.
+        #
+        # Teste: kubectl exec -it <pod> -- grep Seccomp /proc/1/status
+        # Se ver "Seccomp: 2" → filtrado. "Seccomp: 0" → unconfined (ruim).
+        seccompProfile:
+          type: RuntimeDefault
 
       containers:
         - name: manager

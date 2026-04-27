@@ -8,8 +8,20 @@ metadata:
     # O pod recebe um token OIDC que o GCP aceita como identidade — sem chave JSON.
     iam.gke.io/gcp-service-account: deployguard-operator@certquest.iam.gserviceaccount.com
 ---
-# ClusterRole: permissões que o operator precisa no cluster inteiro.
-# Princípio do menor privilégio: pedimos apenas o que precisamos.
+# ============================================================
+# ClusterRole — permissões QUE PRECISAM ser cluster-wide.
+#
+# Regra mental pra decidir ClusterRole vs Role:
+#   "O recurso vive em namespaces diferentes ou é cluster-scoped?"
+#   - DeployPolicy:      namespaced, mas existe em N namespaces → ClusterRole
+#   - WebhookConfig:     cluster-scoped (não tem namespace)     → ClusterRole
+#   - Lease (leader):    vive só em deployguard-system          → poderia ser Role,
+#                                                                 mas controller-runtime
+#                                                                 facilita com ClusterRole
+#   - Secret do cert:    vive SÓ em deployguard-system          → Role (ver abaixo)
+#
+# Menor privilégio = se algo comprometer o token do SA, o blast radius fica contido.
+# ============================================================
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -30,22 +42,21 @@ rules:
     resources: ["deploypolicies/finalizers"]
     verbs: ["update"]
 
-  # Cert rotator precisa assistir e atualizar o caBundle nos webhook configs.
+  # Cert rotator precisa atualizar o caBundle nos webhook configs.
+  # WebhookConfig é cluster-scoped — não dá pra escopar em Role.
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
     verbs: ["get", "list", "watch", "update", "patch"]
 
-  # Cert rotator precisa ler/criar/atualizar o Secret com o cert.
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
-
-  # Leader election usa Leases.
+  # Leader election usa Leases. Vivem em deployguard-system,
+  # mas o controller-runtime espera ClusterRole por convenção.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Precisa criar Events para reportar erros e ações.
+  # Events pra reportar erros/ações. Precisa ser cluster-wide porque
+  # o controller emite Events no namespace do DeployPolicy sendo reconciliado,
+  # e DeployPolicies podem estar em qualquer namespace.
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -58,6 +69,54 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: deployguard-controller
+subjects:
+  - kind: ServiceAccount
+    name: deployguard-controller
+    namespace: deployguard-system
+---
+# ============================================================
+# Role — permissões LIMITADAS ao namespace deployguard-system.
+#
+# Por que separar?
+# O cert rotator só mexe no Secret "deployguard-webhook-cert" dentro do
+# próprio namespace do operator. Dar "secrets: *" cluster-wide significa que,
+# se o pod for comprometido, o atacante pode ler QUALQUER secret do cluster
+# (incluindo tokens de SA, imagePullSecrets, DBs, etc).
+#
+# Com Role namespaced, o pior caso é ele ler secrets de deployguard-system —
+# onde só existe o cert dele mesmo. Blast radius praticamente zero.
+#
+# Este é o canônico "least privilege" que cai em prova de CKS.
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployguard-cert-rotator
+  namespace: deployguard-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # Sem "list" e "watch" — o rotator só faz Get por nome. Menos ainda de privilégio.
+    # Se um dia você trocar pra watch, adiciona aqui.
+    verbs: ["get", "create", "update", "patch"]
+    # resourceNames restringe AINDA MAIS: só o Secret específico do cert.
+    # Feature avançada de RBAC — muita gente não sabe que existe.
+    resourceNames: ["deployguard-webhook-cert"]
+  # "create" precisa vir numa regra separada porque resourceNames não funciona
+  # com create (o nome só existe DEPOIS do create). Truque conhecido de RBAC.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployguard-cert-rotator
+  namespace: deployguard-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployguard-cert-rotator
 subjects:
   - kind: ServiceAccount
     name: deployguard-controller

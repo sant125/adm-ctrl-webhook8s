@@ -23,27 +23,63 @@ webhooks:
         # CREATE e UPDATE — validamos nos dois casos.
         # DELETE e CONNECT não precisam de validação.
         operations: ["CREATE", "UPDATE"]
-    # namespaceSelector: NUNCA aplique webhook no kube-system.
-    # Um bug no operator poderia impedir criação de pods do sistema.
+    # ========================================================
+    # namespaceSelector + objectSelector: QUEM esse webhook afeta.
+    #
+    # Diferença conceitual:
+    # - namespaceSelector: filtra por LABEL DO NAMESPACE do objeto.
+    # - objectSelector:    filtra por LABEL DO PRÓPRIO OBJETO (o Deployment).
+    #
+    # Estratégia aqui: OPT-IN por label no namespace.
+    # O webhook só é chamado se o namespace tiver `deployguard.io/enforce=enabled`.
+    #
+    # Por que opt-in e não "todos os namespaces menos system"?
+    # - Segurança operacional: em cluster compartilhado você não quer impor policy
+    #   em time alheio sem combinar. Label explícito = contrato consciente.
+    # - Onboarding gradual: você habilita namespace por namespace, ganha confiança.
+    # - Evita incidentes: se o webhook tiver bug, o blast radius é só quem optou.
+    #
+    # Como habilitar um namespace:
+    #   kubectl label namespace production deployguard.io/enforce=enabled
+    # ========================================================
     namespaceSelector:
       matchExpressions:
+        # Opt-in: precisa do label pra valer.
+        - key: deployguard.io/enforce
+          operator: In
+          values: ["enabled"]
+        # Cinto-e-suspensório: mesmo que alguém labele kube-system por engano,
+        # o webhook NUNCA roda em namespaces do sistema. Um bug do operator
+        # travando criação de pods em kube-system = cluster dead.
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values:
             - kube-system
             - kube-public
             - kube-node-lease
-            - deployguard-system  # evita recursão no próprio operator
-    # objectSelector: opt-in por annotation.
-    # Namespaces precisam ter a annotation "deployguard.io/enforce: enabled"
-    # para serem afetados. Isso evita surpresas em clusters existentes.
+            - deployguard-system   # evita recursão do próprio operator
+    # objectSelector vazio = qualquer Deployment dentro de um namespace opted-in.
+    # Se um dia quiser "rodar só em Deployments com label X", botaria aqui.
     objectSelector:
-      matchLabels: {}  # sem filtro por objeto — filtramos por namespace acima
-    # failurePolicy: o que fazer se o webhook estiver indisponível.
-    # Fail: rejeita o deploy se o webhook não responder (mais seguro, pode travar deploys)
-    # Ignore: permite o deploy se o webhook não responder (mais permissivo)
-    # Use Ignore em dev/staging, Fail em prod.
-    failurePolicy: Ignore
+      matchLabels: {}
+    # failurePolicy: o que o API server faz quando NÃO consegue falar com o webhook
+    # (timeout, pod caído, network policy barrando, cert inválido, etc).
+    #
+    # Fail    → API server REJEITA o request. "fail closed" — mais seguro.
+    # Ignore  → API server APROVA o request sem chamar nós. "fail open" — mais disponível.
+    #
+    # Tradeoff real:
+    # - Fail + webhook caído = ninguém consegue criar/atualizar Deployment. Seu
+    #   operator vira um SPOF de deploys. Mitigar com: 2+ réplicas, PodDisruptionBudget,
+    #   leader election (já temos), namespaceSelector excluindo kube-system (já temos).
+    # - Ignore + webhook caído = requests passam sem validar. Admission de segurança
+    #   que pode ser ignorada é só teatro — alguém pode derrubar o webhook de propósito.
+    #
+    # Regra prática: se o webhook EXISTE pra garantir segurança/compliance, use Fail.
+    # Se é só enrichment/UX (labels, defaults), pode usar Ignore.
+    # Como o DeployGuard bloqueia imagem :latest e exige resources, é política de
+    # segurança → Fail.
+    failurePolicy: Fail
     # sideEffects: nosso webhook não tem side effects — apenas lê e valida.
     sideEffects: None
     # timeoutSeconds: o API server aguarda no máximo esse tempo.
